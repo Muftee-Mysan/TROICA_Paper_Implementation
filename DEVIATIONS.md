@@ -156,3 +156,110 @@ assumption sweep behind `docs/assumption_log.md`.
 recording the effect; a script makes that reproducible rather than a note.
 
 **Effect on results.** None.
+
+---
+
+## D9. A learned tracker as an alternative to paper Section III-D
+
+**What.** A second tracker plug-in, `tracker.method: xgboost`, selected by
+`configs/xgboost_tracker.yaml`. The SSA, temporal-difference and SSR stages are
+untouched. Instead of the paper's Cases 1-3 and verification rules, it takes the
+strongest SSR peaks in 40-200 BPM as candidates, scores each with a pre-trained
+XGBoost classifier, and takes the best. A jump guard replaces the paper's
+verification: a top candidate more than `max_jump_bins` from the previous
+estimate is held back until it has won `jump_patience` windows in a row.
+
+The model is trained by `experiments/train_xgboost_tracker.py` on candidate rows
+labelled against the ECG: first from the paper tracker's trajectory, then from
+the learned tracker's own roll-outs. Ground truth is used only to label rows
+after a run; the plug-in never reads it. `xgboost` is an optional dependency
+(`pip install -e '.[ml]'`) and the model file lives in the git-ignored `models/`.
+
+**Why.** An experiment in whether the final stage can be learned, in particular
+whether a search over the whole band recovers from a wrong first window, which
+the paper's local search cannot (subject 10).
+
+**Effect on results.** None on the default configuration, which still uses
+`tracker.method: troika`. The learned tracker is trained on the same 12
+recordings it is otherwise evaluated on, so the only valid number for it is the
+leave-one-subject-out one from `train_xgboost_tracker.py --loso`.
+
+---
+
+## D10. A TinyEfficientNet1D scorer for the learned tracker
+
+**What.** A third tracker plug-in, `tracker.method: efficientnet1d`, selected by
+`configs/efficientnet1d_tracker.yaml`. It is the D9 tracker with the XGBoost
+classifier swapped for a small 1-D EfficientNet (three MBConv blocks with
+squeeze-and-excitation, `src/troika/tracking/efficientnet1d.py`). Candidates,
+first-window initialisation and the jump guard are shared with D9. For each
+candidate the network reads a crop of the SSR spectrum centred on it (32 bins
+either side by default) and takes the 13 D9 features, standardised, as `aux`
+at the head.
+
+The model is trained by `experiments/train_efficientnet_tracker.py` with the
+same protocol as D9: paper-tracker rows first, then the tracker's own
+roll-outs, labelled against the ECG after each run. `torch` is an optional
+dependency (`pip install -e '.[dl]'`) and the model file lives in the
+git-ignored `models/`.
+
+**Why.** An experiment in whether a network that sees the spectrum shape around
+a peak ranks candidates better than trees on hand-made features alone.
+
+**Effect on results.** None on the default configuration. As with D9, the only
+valid number is the leave-one-subject-out one from
+`train_efficientnet_tracker.py --loso`.
+
+---
+
+## D11. An MLP ablation of the D10 scorer
+
+**What.** A fourth tracker plug-in, `tracker.method: mlp`, selected by
+`configs/mlp_tracker.yaml`. It is the D10 tracker with the network reduced to
+its head (`src/troika/tracking/mlp.py`): one hidden layer of 32 units on the 13
+standardised D9 features, with no convolutions and no spectrum crop.
+Candidates, first-window initialisation and the jump guard are shared with D9
+and D10. The D10 code is untouched.
+
+The model is trained by `experiments/train_mlp_tracker.py` with the same
+protocol and defaults as D10. Models go to `models/loso_mlp/` and results to
+`results/mlp_loso_<timestamp>/`.
+
+**Why.** To measure what the convolutions over the spectrum crop add: the MLP
+and the D10 network share the features, the head, the training protocol and the
+jump guard, and differ only in the crop branch.
+
+**Effect on results.** None on the default configuration or on D10's numbers.
+As with D9, the only valid number is the leave-one-subject-out one from
+`train_mlp_tracker.py --loso`.
+
+---
+
+## D12. A hidden-Markov path tracker in place of the jump guard
+
+**What.** A fifth tracker plug-in, `tracker.method: hmm`, selected by
+`configs/hmm_tracker.yaml`. Candidates and first-window initialisation are those
+of D9. The jump guard is replaced by a hidden Markov model whose states are the
+bins of the 40-200 BPM band (`src/troika/tracking/hmm.py`):
+
+* transition: a Gaussian step of `transition_sigma_bins`, plus `jump_prob`
+  spread uniformly over the band;
+* emission: each candidate raises the bins within `emission_sigma_bins` of it
+  in proportion to its score, above `emission_floor`;
+* estimate: the end of the best path so far (one Viterbi step per window), so
+  the tracker stays causal and never revises an earlier window.
+
+`tracker.scorer` chooses what scores the candidates: `spectrum` (their relative
+SSR power, no model) or the D9, D10 or D11 model loaded from `model_path`. The
+HMM has no fitted weights; its four parameters are hand-set config keys.
+`experiments/eval_hmm_tracker.py` evaluates it leave-one-subject-out on the fold
+models the D9-D11 `--loso` runs saved, next to the same models behind the guard.
+
+**Why.** An experiment in whether weighing every window's scores along a path
+tracks better than the guard's fixed rule (hold a far candidate until it has
+won `jump_patience` windows).
+
+**Effect on results.** None on the default configuration. The roll-out models
+of D9-D11 were trained on roll-outs of the guard tracker, not of the HMM. Any
+tuning of the four HMM parameters on the 12 training recordings makes the
+reported number optimistic.
